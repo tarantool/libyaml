@@ -52,9 +52,13 @@ configure_file(
   ${config_h}
   )
 
-add_library(yaml ${SRCS})
+if(ENABLE_BUNDLED_LIBYAML)
+  add_library(yaml STATIC ${SRCS})
+else()
+  add_library(yaml ${SRCS})
+endif()
 
-if(NOT BUILD_SHARED_LIBS)
+if(NOT BUILD_SHARED_LIBS OR ENABLE_BUNDLED_LIBYAML)
   set_target_properties(yaml
     PROPERTIES OUTPUT_NAME yaml_static
     )
@@ -67,7 +71,7 @@ set_target_properties(yaml
 target_compile_definitions(yaml
   PRIVATE HAVE_CONFIG_H
   PUBLIC
-    $<$<NOT:$<BOOL:${BUILD_SHARED_LIBS}>>:YAML_DECLARE_STATIC>
+    $<$<OR:$<NOT:$<BOOL:${BUILD_SHARED_LIBS}>>,$<BOOL:${ENABLE_BUNDLED_LIBYAML}>>:YAML_DECLARE_STATIC>
     $<$<BOOL:${MSVC}>:_CRT_SECURE_NO_WARNINGS>
   )
 
