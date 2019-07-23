@@ -442,7 +442,8 @@ yaml_emitter_is_printable(yaml_string_t string)
             (octet & 0xE0) == 0xC0 ? octet & 0x1F :
             (octet & 0xF0) == 0xE0 ? octet & 0x0F :
             (octet & 0xF8) == 0xF0 ? octet & 0x07 : 0;
-    for (int k = 1; k < (int)width; k ++) {
+    int k;
+    for (k = 1; k < (int)width; k ++) {
         octet = string.pointer[k];
         value = (value << 6) + (octet & 0x3F);
     }
