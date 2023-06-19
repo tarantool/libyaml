@@ -89,9 +89,6 @@ static int
 yaml_emitter_increase_indent(yaml_emitter_t *emitter,
         int flow, int indentless);
 
-static inline int
-yaml_emitter_is_printable(yaml_string_t string);
-
 /*
  * State functions.
  */
@@ -423,15 +420,19 @@ yaml_emitter_increase_indent(yaml_emitter_t *emitter,
 }
 
 /*
- * Checks if given utf-8 encoded code point represent printable character.
+ * Checks if the current string character begins a valid utf-8 sequence.
+ * On success returns 1 and stores the utf-8 code point and its width in
+ * out_value and out_width. On failure returns 0.
  */
 
-static inline int
-yaml_emitter_is_printable(yaml_string_t string)
+static int
+yaml_utf8_get_code_point(yaml_string_t string,
+        unsigned int *out_value, unsigned int *out_width)
 {
     unsigned char octet;
     unsigned int width;
     unsigned int value;
+    int k;
 
     octet = string.pointer[0];
     width = (octet & 0x80) == 0x00 ? 1 :
@@ -442,22 +443,33 @@ yaml_emitter_is_printable(yaml_string_t string)
             (octet & 0xE0) == 0xC0 ? octet & 0x1F :
             (octet & 0xF0) == 0xE0 ? octet & 0x0F :
             (octet & 0xF8) == 0xF0 ? octet & 0x07 : 0;
-    int k;
+    if (!width) return 0;
+    if (string.pointer+width > string.end) return 0;
     for (k = 1; k < (int)width; k ++) {
         octet = string.pointer[k];
+        if ((octet & 0xC0) != 0x80) return 0;
         value = (value << 6) + (octet & 0x3F);
     }
-    return (((string).pointer[0] == 0x0A)
-            || ((string).pointer[0] >= 0x20 && (string).pointer[0] <= 0x7E)
-            || ((string).pointer[0] == 0xC2 && (string).pointer[1] >= 0xA0)
-            || ((string).pointer[0] > 0xC2 && (string).pointer[0] < 0xED)
-            || ((string).pointer[0] == 0xED && (string).pointer[1] < 0xA0)
-            || ((string).pointer[0] == 0xEE)
-            || ((string).pointer[0] == 0xEF
-                && !((string).pointer[1] == 0xBB && (string).pointer[2] == 0xBF)
-                && !((string).pointer[1] == 0xBF
-                     && ((string).pointer[2] == 0xBE || (string).pointer[2] == 0xBF)))
-            || u_isprint(value));
+    if (!((width == 1) ||
+        (width == 2 && value >= 0x80) ||
+        (width == 3 && value >= 0x800) ||
+        (width == 4 && value >= 0x10000))) return 0;
+
+    *out_value = value;
+    *out_width = width;
+    return 1;
+}
+
+/*
+ * Checks if the given utf-8 code point represents a printable character.
+ * We consider a line break ('\n') to be printable because it may be emitted
+ * without escaping if there are no other unprintable characters.
+ */
+
+static int
+yaml_utf8_is_printable(unsigned int value)
+{
+    return value == '\n' || u_isprint(value);
 }
 
 /*
@@ -1519,7 +1531,9 @@ yaml_emitter_analyze_scalar(yaml_emitter_t *emitter,
     yaml_string_t string;
 
     int block_indicators = 0;
+    int block_indicators_if_followed_by_whitespace = 0;
     int flow_indicators = 0;
+    int flow_indicators_if_followed_by_whitespace = 0;
     int line_breaks = 0;
     int special_characters = 0;
 
@@ -1531,7 +1545,6 @@ yaml_emitter_analyze_scalar(yaml_emitter_t *emitter,
     int space_break = 0;
 
     int preceded_by_whitespace = 0;
-    int followed_by_whitespace = 0;
     int previous_space = 0;
     int previous_break = 0;
 
@@ -1562,10 +1575,32 @@ yaml_emitter_analyze_scalar(yaml_emitter_t *emitter,
     }
 
     preceded_by_whitespace = 1;
-    followed_by_whitespace = IS_BLANKZ_AT(string, WIDTH(string));
 
     while (string.pointer != string.end)
     {
+        int is_whitespace = 0;
+        unsigned int value;
+        unsigned int width;
+
+        if (!yaml_utf8_get_code_point(string, &value, &width)) {
+            special_characters = 1;
+            string.pointer++;
+            continue;
+        }
+
+        if (!yaml_utf8_is_printable(value)
+                || (!emitter->unicode && !IS_ASCII(string))) {
+            special_characters = 1;
+        }
+
+        is_whitespace = IS_BLANKZ(string);
+        if (is_whitespace && block_indicators_if_followed_by_whitespace)
+            block_indicators = 1;
+        block_indicators_if_followed_by_whitespace = 0;
+        if (is_whitespace && flow_indicators_if_followed_by_whitespace)
+            flow_indicators = 1;
+        flow_indicators_if_followed_by_whitespace = 0;
+
         if (string.start == string.pointer)
         {
             if (CHECK(string, '#') || CHECK(string, ',')
@@ -1582,14 +1617,12 @@ yaml_emitter_analyze_scalar(yaml_emitter_t *emitter,
 
             if (CHECK(string, '?') || CHECK(string, ':')) {
                 flow_indicators = 1;
-                if (followed_by_whitespace) {
-                    block_indicators = 1;
-                }
+                block_indicators_if_followed_by_whitespace = 1;
             }
 
-            if (CHECK(string, '-') && followed_by_whitespace) {
-                flow_indicators = 1;
-                block_indicators = 1;
+            if (CHECK(string, '-')) {
+                flow_indicators_if_followed_by_whitespace = 1;
+                block_indicators_if_followed_by_whitespace = 1;
             }
         }
         else
@@ -1602,20 +1635,13 @@ yaml_emitter_analyze_scalar(yaml_emitter_t *emitter,
 
             if (CHECK(string, ':')) {
                 flow_indicators = 1;
-                if (followed_by_whitespace) {
-                    block_indicators = 1;
-                }
+                block_indicators_if_followed_by_whitespace = 1;
             }
 
             if (CHECK(string, '#') && preceded_by_whitespace) {
                 flow_indicators = 1;
                 block_indicators = 1;
             }
-        }
-
-        if (!yaml_emitter_is_printable(string)
-                || (!IS_ASCII(string) && !emitter->unicode)) {
-            special_characters = 1;
         }
 
         if (IS_BREAK(string)) {
@@ -1656,12 +1682,14 @@ yaml_emitter_analyze_scalar(yaml_emitter_t *emitter,
             previous_break = 0;
         }
 
-        preceded_by_whitespace = IS_BLANKZ(string);
+        preceded_by_whitespace = is_whitespace;
         MOVE(string);
-        if (string.pointer != string.end) {
-            followed_by_whitespace = IS_BLANKZ_AT(string, WIDTH(string));
-        }
     }
+
+    if (block_indicators_if_followed_by_whitespace)
+        block_indicators = 1;
+    if (flow_indicators_if_followed_by_whitespace)
+        flow_indicators = 1;
 
     emitter->scalar_data.multiline = line_breaks;
 
@@ -2057,6 +2085,42 @@ yaml_emitter_write_single_quoted_scalar(yaml_emitter_t *emitter,
     return 1;
 }
 
+/*
+ * Writes a utf-8 code point to the emitter *without* a backslash ('\').
+ * The output format depends on the code point type:
+ * - 'xFF' for single-byte code points.
+ * - 'uFFFF' for multi-byte code points <= 0xFFFF.
+ * - 'UFFFFFFFF' for multi-byte code points > 0xFFFF.
+ * ('F' is any hexadecimal digit.)
+ */
+
+static int
+yaml_emitter_write_code_point(yaml_emitter_t *emitter,
+        unsigned int value, unsigned int width)
+{
+    int k;
+
+    if (width == 1) {
+        assert(value <= 0xFF);
+        if (!PUT(emitter, 'x')) return 0;
+        width = 2;
+    }
+    else if (value <= 0xFFFF) {
+        if (!PUT(emitter, 'u')) return 0;
+        width = 4;
+    }
+    else {
+        if (!PUT(emitter, 'U')) return 0;
+        width = 8;
+    }
+    for (k = (width-1)*4; k >= 0; k -= 4) {
+        int digit = (value >> k) & 0x0F;
+        if (!PUT(emitter, digit + (digit < 10 ? '0' : 'A'-10)))
+            return 0;
+    }
+    return 1;
+}
+
 static int
 yaml_emitter_write_double_quoted_scalar(yaml_emitter_t *emitter,
         yaml_char_t *value, size_t length, int allow_breaks)
@@ -2071,28 +2135,21 @@ yaml_emitter_write_double_quoted_scalar(yaml_emitter_t *emitter,
 
     while (string.pointer != string.end)
     {
-        if (!yaml_emitter_is_printable(string) || (!emitter->unicode && !IS_ASCII(string))
-                || IS_BOM(string) || IS_BREAK(string)
-                || CHECK(string, '"') || CHECK(string, '\\'))
-        {
-            unsigned char octet;
-            unsigned int width;
-            unsigned int value;
-            int k;
+        unsigned int value;
+        unsigned int width;
 
-            octet = string.pointer[0];
-            width = (octet & 0x80) == 0x00 ? 1 :
-                    (octet & 0xE0) == 0xC0 ? 2 :
-                    (octet & 0xF0) == 0xE0 ? 3 :
-                    (octet & 0xF8) == 0xF0 ? 4 : 0;
-            value = (octet & 0x80) == 0x00 ? octet & 0x7F :
-                    (octet & 0xE0) == 0xC0 ? octet & 0x1F :
-                    (octet & 0xF0) == 0xE0 ? octet & 0x0F :
-                    (octet & 0xF8) == 0xF0 ? octet & 0x07 : 0;
-            for (k = 1; k < (int)width; k ++) {
-                octet = string.pointer[k];
-                value = (value << 6) + (octet & 0x3F);
-            }
+        if (!yaml_utf8_get_code_point(string, &value, &width)) {
+            if (!PUT(emitter, '\\')
+                    || !yaml_emitter_write_code_point(emitter,
+                        string.pointer[0], 1))
+                return 0;
+            string.pointer++;
+            spaces = 0;
+        }
+        else if (!yaml_utf8_is_printable(value)
+                || (!emitter->unicode && !IS_ASCII(string))
+                || value == '\n' || value == '"' || value == '\\')
+        {
             string.pointer += width;
 
             if (!PUT(emitter, '\\')) return 0;
@@ -2160,23 +2217,8 @@ yaml_emitter_write_double_quoted_scalar(yaml_emitter_t *emitter,
                     break;
 
                 default:
-                    if (value <= 0xFF) {
-                        if (!PUT(emitter, 'x')) return 0;
-                        width = 2;
-                    }
-                    else if (value <= 0xFFFF) {
-                        if (!PUT(emitter, 'u')) return 0;
-                        width = 4;
-                    }
-                    else {
-                        if (!PUT(emitter, 'U')) return 0;
-                        width = 8;
-                    }
-                    for (k = (width-1)*4; k >= 0; k -= 4) {
-                        int digit = (value >> k) & 0x0F;
-                        if (!PUT(emitter, digit + (digit < 10 ? '0' : 'A'-10)))
-                            return 0;
-                    }
+                    if (!yaml_emitter_write_code_point(emitter, value, width))
+                        return 0;
             }
             spaces = 0;
         }

@@ -843,7 +843,6 @@ yaml_scalar_event_initialize(yaml_event_t *event,
         length = strlen((char *)value);
     }
 
-    if (!yaml_check_utf8(value, length)) goto error;
     value_copy = YAML_MALLOC(length+1);
     if (!value_copy) goto error;
     memcpy(value_copy, value, length);
