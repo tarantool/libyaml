@@ -3239,7 +3239,7 @@ yaml_parser_scan_flow_scalar(yaml_parser_t *parser, yaml_token_t *token,
                         goto error;
                     }
 
-                    if (value <= 0x7F) {
+                    if (value <= 0x7F || code_length == 2) {
                         *(string.pointer++) = value;
                     }
                     else if (value <= 0x7FF) {
